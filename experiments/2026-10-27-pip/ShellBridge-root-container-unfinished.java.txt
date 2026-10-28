@@ -1,0 +1,258 @@
+package ca.jeeth.switchboard.bridge;
+
+import android.content.ComponentName;
+import android.graphics.Rect;
+import android.os.IBinder;
+import org.json.*;
+import java.io.*;
+import java.lang.reflect.*;
+import java.util.*;
+import java.net.*;
+import java.security.*;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+
+/** Temporary shell-UID helper. Requests require the launcher's private authentication key. */
+public final class ShellBridge {
+    private static Object tasks;
+    private static Class<?> taskApi;
+    private static Integer originalCec;
+    private static final Map<String,int[]> originalWindows=new HashMap<>();
+    private static final Map<String,Object> insetHosts=new HashMap<>();
+    private static byte[] readKey()throws Exception{
+        Process p=new ProcessBuilder("/system/bin/run-as","ca.jeeth.switchboard","cat","files/bridge-key").start();
+        ByteArrayOutputStream bytes=new ByteArrayOutputStream();byte[] buffer=new byte[64];int count;
+        try(InputStream in=p.getInputStream()){while((count=in.read(buffer))!=-1)bytes.write(buffer,0,count);}
+        if(p.waitFor()!=0||bytes.size()!=32)throw new IOException("Helper key missing; run start-helper.sh again");return bytes.toByteArray();
+    }
+    private static byte[] sign(byte[] key,int role,byte[] challenge,byte[] nonce)throws Exception{
+        Mac mac=Mac.getInstance("HmacSHA256");mac.init(new SecretKeySpec(key,"HmacSHA256"));mac.update((byte)role);mac.update(challenge);return mac.doFinal(nonce);
+    }
+    private static void authenticateClient(DataInputStream in,DataOutputStream out,byte[] key)throws Exception{
+        byte[] challenge=new byte[32],nonce=new byte[32],proof=new byte[32];in.readFully(challenge);new SecureRandom().nextBytes(nonce);
+        out.write(nonce);out.write(sign(key,0,challenge,nonce));out.flush();in.readFully(proof);
+        if(!MessageDigest.isEqual(proof,sign(key,1,challenge,nonce)))throw new SecurityException("Helper authentication failed");
+    }
+    private static void authenticateServer(DataInputStream in,DataOutputStream out,byte[] key)throws Exception{
+        byte[] challenge=new byte[32],nonce=new byte[32],proof=new byte[32];new SecureRandom().nextBytes(challenge);out.write(challenge);out.flush();
+        in.readFully(nonce);in.readFully(proof);if(!MessageDigest.isEqual(proof,sign(key,0,challenge,nonce)))throw new SecurityException("Client authentication failed");
+        out.write(sign(key,1,challenge,nonce));out.flush();
+    }
+    private static String run(String... args)throws Exception{
+        Process p=new ProcessBuilder(args).redirectErrorStream(true).start();
+        ByteArrayOutputStream bytes=new ByteArrayOutputStream();
+        byte[] buffer=new byte[4096];int count;
+        try(InputStream in=p.getInputStream()){while((count=in.read(buffer))!=-1){if(bytes.size()<65536)bytes.write(buffer,0,count);}}
+        int code=p.waitFor();String result=bytes.toString("UTF-8");
+        if(code!=0)throw new IOException(result.trim());return result;
+    }
+    private static Object invoke(String name,Class<?>[] signature,Object... args)throws Exception{
+        return taskApi.getMethod(name,signature).invoke(tasks,args);
+    }
+    private static List<?> list()throws Exception{return (List<?>)invoke("getTasks",new Class[]{int.class,boolean.class,boolean.class},100,false,false);}
+    static boolean taskMatches(String wanted,String base,String top){
+        if(wanted.equals(base)||wanted.equals(top))return true;
+        String pkg=wanted.substring(0,wanted.indexOf('/'));
+        // Our launcher and HDMI host intentionally use separate tasks in the same package.
+        if(pkg.equals("ca.jeeth.switchboard"))return false;
+        return base!=null&&base.startsWith(pkg+"/")||top!=null&&top.startsWith(pkg+"/");
+    }
+    private static Object find(String component)throws Exception{
+        String wanted=ComponentName.unflattenFromString(component).flattenToString();
+        for(Object task:list()){
+            ComponentName base=(ComponentName)task.getClass().getField("baseActivity").get(task);
+            ComponentName top=(ComponentName)task.getClass().getField("topActivity").get(task);
+            if(taskMatches(wanted,base==null?null:base.flattenToString(),top==null?null:top.flattenToString()))return task;
+        }return null;
+    }
+    private static int id(Object task)throws Exception{return task.getClass().getField("taskId").getInt(task);}
+    private static Object token(Object task)throws Exception{return task.getClass().getField("token").get(task);}
+    private static Object taskOrganizer()throws Exception{
+        Object controller=invoke("getWindowOrganizerController",new Class[]{});
+        return Class.forName("android.window.IWindowOrganizerController").getMethod("getTaskOrganizerController").invoke(controller);
+    }
+    private static List<?> roots()throws Exception{
+        return (List<?>)Class.forName("android.window.ITaskOrganizerController").getMethod("getRootTasks",int.class,int[].class).invoke(taskOrganizer(),0,null);
+    }
+    private static Object createInsetHost()throws Exception{
+        IBinder cookie=new android.os.Binder();Object controller=taskOrganizer();
+        Class.forName("android.window.ITaskOrganizerController").getMethod("createRootTask",int.class,int.class,IBinder.class).invoke(controller,0,5,cookie);
+        for(Object root:roots()){
+            List<?> cookies=(List<?>)root.getClass().getField("launchCookies").get(root);
+            if(cookies.contains(cookie))return root;
+        }
+        throw new IOException("TV did not expose the new inset container");
+    }
+    private static void reparent(Object task,Object parent)throws Exception{
+        Class<?> txType=Class.forName("android.window.WindowContainerTransaction"),tokenType=Class.forName("android.window.WindowContainerToken");
+        Object tx=txType.getConstructor().newInstance();
+        txType.getMethod("reparent",tokenType,tokenType,boolean.class).invoke(tx,token(task),parent==null?null:token(parent),true);
+        txType.getMethod("setWindowingMode",tokenType,int.class).invoke(tx,token(task),1);
+        txType.getMethod("setBounds",tokenType,Rect.class).invoke(tx,token(task),null);
+        Class<?> organizer=Class.forName("android.window.WindowOrganizer");
+        organizer.getMethod("applyTransaction",txType).invoke(organizer.getConstructor().newInstance(),tx);
+    }
+    private static void placeInset(String component,Object task,Rect rectangle)throws Exception{
+        Object host=insetHosts.get(component);
+        if(host==null){host=createInsetHost();insetHosts.put(component,host);}
+        arrange(host,5,rectangle);reparent(task,host);
+    }
+    private static void removeInsetHosts()throws Exception{
+        for(Object host:insetHosts.values()){
+            for(Object child:list())if(child.getClass().getField("parentTaskId").getInt(child)==id(host))reparent(child,null);
+            for(Object child:list())if(child.getClass().getField("parentTaskId").getInt(child)==id(host))throw new IOException("An inset app could not be detached safely");
+            Object controller=taskOrganizer();
+            Class.forName("android.window.ITaskOrganizerController").getMethod("deleteRootTask",Class.forName("android.window.WindowContainerToken")).invoke(controller,token(host));
+        }
+        insetHosts.clear();
+    }
+    private static Object windowConfig(Object task)throws Exception{
+        Object config=task.getClass().getField("configuration").get(task);
+        return config.getClass().getField("windowConfiguration").get(config);
+    }
+    private static int mode(Object task)throws Exception{
+        Object w=windowConfig(task);return (Integer)w.getClass().getMethod("getWindowingMode").invoke(w);
+    }
+    private static Rect bounds(Object task)throws Exception{
+        Object w=windowConfig(task);return new Rect((Rect)w.getClass().getMethod("getBounds").invoke(w));
+    }
+    static int[] fitInset(int requestedWidth,int actualWidth,int actualHeight,int screenWidth,int screenHeight,int corner){
+        int width=Math.max(requestedWidth,Math.max(actualWidth,(actualHeight*16+8)/9));
+        width=((width+15)/16)*16;int height=width*9/16;
+        if(width>screenWidth-48||height>screenHeight-48)throw new IllegalArgumentException("The app's minimum window is too large for a 16:9 inset on this display");
+        int left=corner%2==0?screenWidth-width-24:24,top=corner<2?24:screenHeight-height-24;
+        return new int[]{left,top,left+width,top+height};
+    }
+    private static void arrange(Object task,int mode,Rect bounds)throws Exception{
+        Object token=task.getClass().getField("token").get(task);
+        IBinder binder=(IBinder)token.getClass().getMethod("asBinder").invoke(token);
+        Class<?> txType=Class.forName("android.window.WindowContainerTransaction");
+        Object tx=txType.getConstructor().newInstance();
+        Class<?> tokenType=Class.forName("android.window.WindowContainerToken");
+        try{
+            txType.getMethod("setWindowingMode",tokenType,int.class).invoke(tx,token,mode);
+            txType.getMethod("setBounds",tokenType,Rect.class).invoke(tx,token,bounds);
+        }catch(NoSuchMethodException e){
+            txType.getMethod("setWindowingMode",IBinder.class,int.class).invoke(tx,binder,mode);
+            txType.getMethod("setBounds",IBinder.class,Rect.class).invoke(tx,binder,bounds);
+        }
+        Class<?> organizer=Class.forName("android.window.WindowOrganizer");
+        organizer.getMethod("applyTransaction",txType).invoke(organizer.getConstructor().newInstance(),tx);
+    }
+    private static int cec()throws Exception{
+        String result=run("/system/bin/cmd","hdmi_control","cec_setting","get","hdmi_cec_enabled");
+        return result.trim().endsWith("1")?1:0;
+    }
+    private static void cec(int value)throws Exception{run("/system/bin/cmd","hdmi_control","cec_setting","set","hdmi_cec_enabled",Integer.toString(value));}
+    private static String component(JSONObject request)throws Exception{
+        String value=request.getString("component");
+        if(value.length()>250||!value.matches("[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+"))throw new IOException("Invalid component");
+        return value;
+    }
+    private static JSONObject handle(JSONObject r)throws Exception{
+        JSONObject result=new JSONObject().put("ok",true);
+        String command=r.getString("command");
+        switch(command){
+            case "status":return result.put("pid",android.os.Process.myPid()).put("bootCount",run("/system/bin/settings","get","global","boot_count").trim())
+                .put("freeformSetting",run("/system/bin/settings","get","global","enable_freeform_support").trim())
+                .put("forceResizeSetting",run("/system/bin/settings","get","global","force_resizable_activities").trim()).put("cec",cec());
+            case "enableFreeform":{
+                result.put("previousFreeform",run("/system/bin/settings","get","global","enable_freeform_support").trim());
+                result.put("previousResize",run("/system/bin/settings","get","global","force_resizable_activities").trim());
+                run("/system/bin/settings","put","global","enable_freeform_support","1");
+                run("/system/bin/settings","put","global","force_resizable_activities","1");return result;
+            }
+            case "restoreFreeform":{
+                String[] keys={"enable_freeform_support","force_resizable_activities"};String[] args={"freeform","resize"};
+                for(int i=0;i<keys.length;i++){
+                    String value=r.optString(args[i],"null");if(!Arrays.asList("null","0","1").contains(value))throw new IOException("Invalid setting value");
+                    if(value.equals("null"))run("/system/bin/settings","delete","global",keys[i]);else run("/system/bin/settings","put","global",keys[i],value);
+                }return result;
+            }
+            case "cecLock":{
+                boolean lock=r.getBoolean("lock");
+                if(lock){if(originalCec==null)originalCec=cec();cec(0);}else{cec(r.optInt("restore",originalCec==null?1:originalCec));originalCec=null;}
+                int actual=cec();if(lock&&actual!=0)throw new IOException("TV did not disable CEC");
+                return result.put("original",originalCec==null?actual:originalCec).put("cec",actual);
+            }
+            case "launch":{
+                String target=component(r);int desired=r.optInt("mode",1);
+                if(desired!=1&&desired!=5)throw new IOException("Unsupported window mode");
+                Rect rectangle=desired==5?new Rect(r.getInt("left"),r.getInt("top"),r.getInt("right"),r.getInt("bottom")):null;
+                if(rectangle!=null&&(rectangle.width()<160||rectangle.height()<90||rectangle.left<0||rectangle.top<0||rectangle.right>8192||rectangle.bottom>8192))throw new IOException("Invalid window bounds");
+                if(!originalWindows.containsKey(target)){
+                    Object before=find(target);Rect old=before==null?new Rect():bounds(before);
+                    originalWindows.put(target,new int[]{before==null?1:mode(before),old.left,old.top,old.right,old.bottom});
+                }
+                List<String> args=new ArrayList<>(Arrays.asList("/system/bin/am","start","-W","--windowingMode",Integer.toString(desired),"-n",target));
+                if(r.has("mainInput")){
+                    if(!target.equals("ca.jeeth.switchboard/.MultiViewActivity"))throw new IOException("Input extras only allowed for the experiment");
+                    args.addAll(Arrays.asList("--es","mainInput",r.getString("mainInput"),"--es","pipInput",r.optString("pipInput","")));
+                }
+                boolean reusing=r.optBoolean("reuse",false)&&find(target)!=null;
+                if(!reusing)run(args.toArray(new String[0]));
+                Object updated=null;
+                // Follow launcher redirects (for example YouTube ShellActivity -> MainActivity).
+                for(int pass=0;pass<(reusing?2:10);pass++){
+                    Object task=find(target);
+                    if(task!=null){
+                        if(desired==5)placeInset(target,task,rectangle);
+                        else if(mode(task)!=desired)arrange(task,desired,rectangle);
+                        Thread.sleep(100);updated=find(target);
+                        if(updated!=null&&rectangle!=null&&r.has("screenWidth")){
+                            Rect actualBounds=bounds(updated);
+                            int[] fitted=fitInset(rectangle.width(),actualBounds.width(),actualBounds.height(),r.getInt("screenWidth"),r.getInt("screenHeight"),r.optInt("corner",0));
+                            rectangle=new Rect(fitted[0],fitted[1],fitted[2],fitted[3]);
+                            if(!rectangle.equals(actualBounds))placeInset(target,updated,rectangle);
+                        }
+                    }
+                    Thread.sleep(150);
+                }
+                updated=find(target);int activityMode=updated==null?0:mode(updated);
+                Object host=insetHosts.get(target);
+                int actual=host!=null&&updated!=null&&updated.getClass().getField("parentTaskId").getInt(updated)==id(host)?5:activityMode;
+                if(actual!=desired)throw new IOException("Firmware kept window mode "+actual+" instead of "+desired+". Enable app windows and restart the TV before retrying.");
+                invoke("setFocusedTask",new Class[]{int.class},id(updated));
+                ComponentName actualComponent=(ComponentName)updated.getClass().getField("topActivity").get(updated);
+                return result.put("taskId",id(updated)).put("mode",actual).put("activityMode",activityMode).put("captionFree",host!=null).put("component",actualComponent==null?"":actualComponent.flattenToShortString()).put("bounds",bounds(updated).toShortString());
+            }
+            case "focus":{
+                Object task=find(component(r));if(task==null)throw new IOException("Source is not running");
+                invoke("setFocusedTask",new Class[]{int.class},id(task));return result;
+            }
+            case "restoreWindows":{
+                removeInsetHosts();
+                for(Map.Entry<String,int[]> e:originalWindows.entrySet()){
+                    Object task=find(e.getKey());if(task==null)continue;int[] v=e.getValue();
+                    arrange(task,v[0],v[0]==1?null:new Rect(v[1],v[2],v[3],v[4]));
+                }originalWindows.clear();return result;
+            }
+            default:throw new IOException("Unknown command");
+        }
+    }
+    public static void main(String[] args)throws Exception{
+        if(android.os.Process.myUid()!=2000)throw new IOException("Start the helper using adb shell");
+        if(args.length==2&&args[0].equals("--request")){
+            try(Socket socket=new Socket("127.0.0.1",38473)){
+                socket.setSoTimeout(20000);DataOutputStream out=new DataOutputStream(socket.getOutputStream());DataInputStream in=new DataInputStream(socket.getInputStream());
+                authenticateClient(in,out,readKey());out.writeUTF(args[1]);out.flush();System.out.println(in.readUTF());
+            }return;
+        }
+        int allowedUid=Integer.parseInt(args[0]);if(allowedUid<10000)throw new IOException("Expected an app UID");
+        taskApi=Class.forName("android.app.IActivityTaskManager");
+        tasks=Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+        byte[] secret=readKey();
+        try(ServerSocket server=new ServerSocket(38473,4,InetAddress.getByName("127.0.0.1"))){
+            System.out.println("Switchboard authenticated loopback helper ready for UID "+allowedUid);
+            while(true){try(Socket client=server.accept()){
+                client.setSoTimeout(5000);
+                DataInputStream in=new DataInputStream(client.getInputStream());DataOutputStream out=new DataOutputStream(client.getOutputStream());
+                authenticateServer(in,out,secret);
+                JSONObject response;
+                try{String payload=in.readUTF();if(payload.length()>8000)throw new IOException("Request too large");response=handle(new JSONObject(payload));}
+                catch(Throwable e){Throwable cause=e;while(cause.getCause()!=null)cause=cause.getCause();response=new JSONObject().put("ok",false).put("error",cause.toString());}
+                out.writeUTF(response.toString());out.flush();
+            }catch(Exception e){System.err.println(e.toString());}}
+        }
+    }
+}
