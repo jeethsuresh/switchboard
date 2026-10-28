@@ -7,5 +7,11 @@
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowNoTitle">true</item>
     </style>
+    <style name="PermissionTheme" parent="AppTheme">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+    </style>
     <string name="guard_description">Remote shortcut protection and Home controls. Customize tap and hold actions for remote buttons. Existing branded-button mappings require a hold; short presses never open a store. Tap Home for Switchboard or hold Home for an overlay over the current screen. Window metadata records local recent-app use and identifies Google TV Home for a firmware fallback. This service does not read screen contents or send data. TCL firmware may handle some buttons before Android delivers them.</string>
 </resources>

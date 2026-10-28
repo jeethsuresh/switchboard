@@ -1,3 +1,21 @@
+# Continue Watching and thumbnails — 2026-10-28
+
+Current installed launcher: 0.3.1 (versionCode 4). The owner requested a horizontal Continue Watching row ABOVE the recently used app: center → Up once Recent app → Up twice Continue Watching; Left/Right browse, Down returns to Recent app. The 4×4 app grid and HDMI rail remain. The same row is available in the hold-Home overlay. The owner then requested thumbnails, now included.
+
+WatchNextRepository reads only searchable Watch Next rows using the ordinary dangerous permission android.permission.READ_TV_LISTINGS. The row itself offers a runtime permission prompt. Query with no SQL selection and no sort order; Android 12 limits other callers to their own rows plus searchable rows, and shell queries lack this read permission. Do not mistake an empty shell query for an empty shared feed. Use the optional read-only WatchNextProbe instrumentation test to check actual app-context visibility. No root, shell helper, app login or Google cloud feed scraping is involved.
+
+New code: WatchEntry (pure metadata/filtering/order), WatchNextRepository (background reader/cache/content observer/scoped resume links), WatchNextMenus (hide/details/options), ListingsPermissionActivity (runtime grant), and a four-card horizontal viewport in DashboardView. Hidden state is private to Switchboard; the provider is never mutated. Catalog and remote mappings are retained. Android test output includes only aggregate counts and provider names, never show titles; any actual viewing metadata stays out of source and public notes.
+
+ThumbnailCache reads thumbnail_uri (poster_art_uri when no thumbnail URI is supplied), fetching only supplied HTTP(S), content or resource images. Two workers, bounded queue, 6 MiB memory and 24 MiB / 200-file private disk cache; decoded dimension limit 768px, encoded limit 4 MiB, disk freshness 24h, failure retry backoff 60s. WatchArtDrawable crops artwork with a text scrim and mint focus border in one background drawable. Stale callbacks cannot replace a recycled card's artwork. App icons remain the fallback. No image I/O or decoding runs on the main thread; URLs are not logged. The Internet permission now also supports publisher artwork.
+
+Pure Java navigation, HoldGate and WatchEntry tests pass; assembleDebug, assembleDebugAndroidTest and lintDebug pass with no errors. A read-only instrumentation run confirmed 17 usable Watch Next entries from three installed providers and all four visible artwork URLs loaded with bounded decoded sizes. It instantiated the real DashboardView and verified two-Up navigation, horizontal selection, scrolling to the last item, and Down returning to Recent app. The owner authorized waking briefly for testing; the TV was already awake, but its screensaver later covered Home. UIAutomator failed idle/root acquisition, making a previous com.tcl.tv XML dump stale: do not infer a CEC takeover from that dump. After dismissing the screensaver, actual ADB screenshots verified center focus with all four thumbnails, two Up to the first show, Right to the second and Down to Recent app. No show was opened. The temporary test APK was removed and the existing remote guard reconnected (Bound services confirmed). TV-listings permission remains granted. The TV was left awake as stated to the owner because it was awake before testing. CEC was not changed. Existing PiP investigations remain parked. Keep using terminal/ADB only, and do not wake the TV unless authorized.
+
+0.3.1 APK SHA256: 950f1c59a0dd643146ecf4dc53a6346ef0beb0bf8495e949a86adbaf9e34c7b3. Local outputs include the APK, refreshed source ZIP and private preview/home screenshots. Screenshots contain personal viewing titles: keep them out of the public repository and source archive. This source update includes Continue Watching, thumbnails, tests and these handoff notes; generated APKs and private screenshots remain local.
+
+The original 0.2.0 handoff follows for historical context; the current version is described above.
+
+---
+
 # Launcher handoff — 2026-10-27
 
 ## Current direction

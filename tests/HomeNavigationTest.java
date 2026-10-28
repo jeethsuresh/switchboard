@@ -16,6 +16,10 @@ public final class HomeNavigationTest {
         check(HomeNavigation.next(100,0)==0,"Left edge must reach center");
         check(HomeNavigation.next(100,2)==1,"Top edge must reach recent app");
         check(HomeNavigation.next(115,3)==2,"Bottom edge must reach settings");
+        check(HomeNavigation.next(HomeNavigation.next(0,2),2)==200,"Two Up presses must enter Continue Watching");
+        check(HomeNavigation.next(200,1)==201&&HomeNavigation.next(201,0)==200,"Watch row must navigate horizontally");
+        check(HomeNavigation.next(200,0)==200&&HomeNavigation.next(203,1)==203,"Row edges must remain contained");
+        for(int i=200;i<204;i++)check(HomeNavigation.next(i,3)==1,"Down from any watch item must return to the recent app");
         System.out.println("Home navigation: startup directions, input rail and all 16 grid cells pass");
     }
 }
